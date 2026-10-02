@@ -2,7 +2,7 @@
 仓库管理序列化器
 """
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval, Seal
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -193,10 +193,137 @@ class ApprovalSerializer(serializers.ModelSerializer):
     """审批记录序列化器"""
     approver_name = serializers.CharField(source='approver.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = Approval
         fields = [
             'id', 'stock_out', 'approver', 'approver_name',
             'status', 'status_display', 'remark', 'created_at', 'updated_at'
         ]
+
+
+# ==================== 封签谱系 ====================
+
+class SealSerializer(serializers.ModelSerializer):
+    """封签序列化器"""
+    goods_name = serializers.CharField(source='goods.name', read_only=True)
+    goods_code = serializers.CharField(source='goods.code', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    is_recombinable = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Seal
+        fields = [
+            'id', 'seal_no', 'goods', 'goods_name', 'goods_code',
+            'batch_no', 'quantity', 'status', 'status_display',
+            'is_recombinable', 'created_at'
+        ]
+        read_only_fields = fields
+
+
+class SealCreateSerializer(serializers.Serializer):
+    """初始封装入参"""
+    seal_no = serializers.CharField(
+        required=False, allow_blank=True, max_length=64,
+        error_messages={'max_length': '封签号最多64个字符'}
+    )
+    goods = serializers.IntegerField(required=True, error_messages={'required': '请选择货物'})
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True, min_value=0,
+        error_messages={'required': '请填写封装数量', 'invalid': '封装数量必须是数字', 'min_value': '封装数量必须大于0'}
+    )
+    batch_no = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+    def validate_goods(self, value):
+        if not Goods.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('货物不存在')
+        return value
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('封装数量必须大于0')
+        return value
+
+    def validate(self, data):
+        seal_no = data.get('seal_no')
+        if seal_no and Seal.objects.filter(seal_no=seal_no).exists():
+            raise serializers.ValidationError({'seal_no': '封签号已存在'})
+        return data
+
+
+class SealOutputSerializer(serializers.Serializer):
+    """拆分/合并/重封的产出包装描述"""
+    seal_no = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    batch_no = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    quantity = serializers.DecimalField(
+        max_digits=12, decimal_places=2, required=True,
+        error_messages={'required': '请填写包装数量', 'invalid': '包装数量必须是数字'}
+    )
+
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('包装数量必须大于0')
+        return value
+
+
+class SplitSerializer(serializers.Serializer):
+    """拆封入参：一个父封签拆为多个子封签"""
+    seal_no = serializers.CharField(required=True, max_length=64, error_messages={'required': '请填写待拆分封签号'})
+    outputs = SealOutputSerializer(many=True, required=True)
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+    def validate_outputs(self, value):
+        if len(value) < 2:
+            raise serializers.ValidationError('拆分至少需要两个子包装')
+        nos = [o.get('seal_no') for o in value if o.get('seal_no')]
+        if len(nos) != len(set(nos)):
+            raise serializers.ValidationError('子封签号不能重复')
+        return value
+
+
+class MergeSerializer(serializers.Serializer):
+    """合并入参：多个封签合并为一个新封签"""
+    seal_nos = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=True, allow_empty=False
+    )
+    output = SealOutputSerializer(required=True)
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+    def validate_seal_nos(self, value):
+        if len(set(value)) < 2:
+            raise serializers.ValidationError('合并至少需要两个不同的封签')
+        return value
+
+
+class RepackSerializer(serializers.Serializer):
+    """重新封装入参：N 个投入重新封装为 M 个产出"""
+    seal_nos = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=True, allow_empty=False
+    )
+    outputs = SealOutputSerializer(many=True, required=True, allow_empty=False)
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+    def validate_outputs(self, value):
+        nos = [o.get('seal_no') for o in value if o.get('seal_no')]
+        if len(nos) != len(set(nos)):
+            raise serializers.ValidationError('新封签号不能重复')
+        return value
+
+
+class IssueSealsSerializer(serializers.Serializer):
+    """领用封签入参"""
+    seal_nos = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=True, allow_empty=False
+    )
+    receiver = serializers.CharField(required=True, max_length=100, error_messages={'required': '请填写领用人'})
+    receiver_dept = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
+
+
+class FreezeSealsSerializer(serializers.Serializer):
+    """冻结/解冻封签入参"""
+    seal_nos = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=True, allow_empty=False
+    )
+    remark = serializers.CharField(required=False, allow_blank=True, max_length=500)
